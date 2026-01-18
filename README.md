@@ -21,13 +21,6 @@ The repository contains functions to estimate the **Observed Survivor Quantile C
 
 ---
 
-## Contact 
-For questions, please contact:
-Taekwon Hong
-📧 taekwon_hong@ncsu.edu | 📧 taecos5956@gmail.com
-
----
-
 ## Reference
 If you use this code, please cite the following article:  
 
