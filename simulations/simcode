@@ -1,0 +1,490 @@
+rm(list=ls())
+
+# ==============================================================================
+# 0. PREREQUISITE
+# ==============================================================================\
+# Library
+library(survival)     
+library(MASS)         
+library(doParallel)   
+library(foreach)      
+library(parallel)     
+
+# Set your working directory (to save simulation results)
+setwd("")
+
+# ==============================================================================
+# 1. CONFIGURATION & PARAMETERS
+# ==============================================================================
+set.seed(123) 
+
+# --- Simulation Strategy ---
+# Toggle 'test = TRUE' for a quick debug run (check code logic).
+# Toggle 'test = FALSE' for the full production run.
+test <- F
+
+if (test) {
+  # DEBUG MODE: Very small iterations to verify code runs without error
+  n_B     <- 10    # Number of bootstrap samples
+  n_total <- 1000    # Total number of simulation iterations (Reduced for test)
+  n_cov   <- 5     # Iterations to check coverage (bootstrap is slow)
+} else {
+  # PRODUCTION MODE: Full simulation settings
+  n_B     <- 1000   # Sufficient for stable Standard Errors
+  n_total <- 1000  # Sufficient for stable Bias/RMSE
+  n_cov   <- 1000  # Calculate coverage for all datasets (computationally expensive)
+}
+
+# Parallel Processing Setup
+n_cores    <- parallel::detectCores() - 1  # Use all cores minus one to keep OS responsive
+batch_size <- 50                           # (Optional) Used for progress tracking chunks
+
+# --- DATA GENERATION COEFFICIENTS ---
+# Setup: Quadratic Misspecification
+# We generate data using Quadratic terms (X^2), but some estimators will fit Linear models.
+
+# Propensity Score Model (Logistic Regression)
+# alpha[5] = 1.0 implies a quadratic term X1^2. Misspecified models will omit this.
+alpha <- c(-0.5, 0.5, 0.5, -0.2, 1.0)
+
+# Outcome Model (Weibull Survival)
+# Global base vector. 
+# NOTE: beta[2] (Treatment Effect) will be overwritten dynamically inside generate_data
+beta  <- c(-1.0, -0.5, 0.5, 0.2, 1.0)  
+
+# Censoring Model (Exponential)
+# gamma[2] = 0.5 implies censoring depends on Treatment (Dependent Censoring)
+gamma <- c(-0.5, -1.0, 0.1, 0.1)
+
+# Weibull Shape Parameter (nu > 1 implies increasing hazard over time)
+# nu > 1 ensure that the residual life changes depending on t0
+nu    <- 1.5
+
+# ==============================================================================
+# 2. EXPERIMENT SETTINGS GRID
+# ==============================================================================
+# We loop through all combinations of these parameters.
+# n_sim:    Sample size 
+# t0:       Landmark time
+# tau:      Quantile of interest 
+# beta_trt: Treatment coefficient (0 = No protection, -0.5 = Protection/Selection Bias)
+settings_grid <- expand.grid(
+  n_sim    = c(500,2000),
+  t0       = c(0.3, 0.5, 0.7),
+  tau      = c(0.3, 0.5),
+  beta_trt = c(0, -0.5)  
+)
+
+# ==============================================================================
+# 3. HELPER FUNCTIONS
+# ==============================================================================
+# Function: get_bh_lookup
+# ------------------------------------------------------------------------------
+# Extracts the Baseline Hazard H0(t) from a fitted Cox model.
+# Crucial: centered = FALSE returns hazard at X=0 (not X=mean), essential for 
+# manual risk score calculation later. Handles both Stratified and Standard models.
+get_bh_lookup <- function(cox_model) {
+  bh <- basehaz(cox_model, centered = FALSE)
+  if ("strata" %in% colnames(bh)) {
+    bh0 <- bh[bh$strata == "A=0", ]; bh1 <- bh[bh$strata == "A=1", ]
+    bh0 <- bh0[order(bh0$time), ];   bh1 <- bh1[order(bh1$time), ]
+    return(list(strata=TRUE, t0=bh0$time, h0=bh0$hazard, t1=bh1$time, h1=bh1$hazard))
+  } else {
+    bh <- bh[order(bh$time), ]
+    return(list(strata=FALSE, t=bh$time, h=bh$hazard))
+  }
+}
+
+# Function: calc_surv_manual
+# ------------------------------------------------------------------------------
+# Computes S(t|X) = exp(-H0(t) * exp(LP))
+# We compute this manually to ensure we use Absolute Risk (not centered).
+# t0_val is passed to ensure compatibility with calling structure, though logic relies on `times`.
+calc_surv_manual <- function(bh_lookup, lp, times, treatment_arm=NULL, ret_type="surv") {
+  cumhaz <- numeric(length(times))
+  if (bh_lookup$strata) {
+    idx0 <- which(treatment_arm == 0); idx1 <- which(treatment_arm == 1)
+    if(length(idx0) > 0) {
+      t_idx0 <- findInterval(times[idx0], bh_lookup$t0)
+      vals0 <- numeric(length(idx0)); mask0 <- t_idx0 > 0
+      vals0[mask0] <- bh_lookup$h0[t_idx0[mask0]]
+      cumhaz[idx0] <- vals0
+    }
+    if(length(idx1) > 0) {
+      t_idx1 <- findInterval(times[idx1], bh_lookup$t1)
+      vals1 <- numeric(length(idx1)); mask1 <- t_idx1 > 0
+      vals1[mask1] <- bh_lookup$h1[t_idx1[mask1]]
+      cumhaz[idx1] <- vals1
+    }
+  } else {
+    t_idx <- findInterval(times, bh_lookup$t)
+    mask <- t_idx > 0; cumhaz[mask] <- bh_lookup$h[t_idx[mask]]
+  }
+  
+  total_cumhaz <- cumhaz * exp(lp)
+  
+  if (ret_type == "hazard") {
+    return(total_cumhaz)
+  } else {
+    return(exp(-total_cumhaz))
+  }
+}
+
+# Function: generate_data
+# ------------------------------------------------------------------------------
+# Generates synthetic data based on simulation parameters.
+# Mode A (is_counterfactual=TRUE): Returns potential outcomes T(0), T(1) for Truth calc.
+# Mode B (is_counterfactual=FALSE): Returns observed data (X, A, Y, Delta) for estimation.
+# Updated to accept 't0' and 'beta_trt' dynamically.
+generate_data <- function(n, t0, beta_trt, is_counterfactual = FALSE) {
+  Sigma <- matrix(0.2, 3, 3); diag(Sigma) <- 1
+  X <- mvrnorm(n, mu = c(0, 0, 0), Sigma = Sigma)
+  colnames(X) <- c("X1", "X2", "X3")
+  
+  lp_A <- alpha[1] + alpha[2]*X[,1] + alpha[3]*X[,2] + alpha[4]*X[,3] + alpha[5]*(X[,1]^2)
+  ps_true <- 1 / (1 + exp(-lp_A))
+  
+  local_beta <- beta
+  local_beta[2] <- beta_trt
+  
+  lp_T <- function(a) {
+    local_beta[1] + local_beta[2]*a + local_beta[3]*X[,1] + local_beta[4]*X[,2] + local_beta[5]*(X[,1]^2)
+  }
+  
+  if (is_counterfactual) {
+    dat_list <- list()
+    U_pre  <- runif(n)
+    U_post0 <- runif(n)
+    U_post1 <- runif(n)
+    
+    log_lam0_pre <- lp_T(0)
+    log_lam1_pre <- lp_T(1)
+    
+    T0_pre <- (-log(U_pre) / exp(log_lam0_pre))^(1/nu)
+    T1_pre <- (-log(U_pre) / exp(log_lam1_pre))^(1/nu)
+    
+    R0_post <- (-log(U_post0) / exp(log_lam0_pre))^(1/nu)
+    R1_post <- (-log(U_post1) / exp(log_lam1_pre))^(1/nu)
+    
+    T0 <- ifelse(T0_pre <= t0, T0_pre, t0 + R0_post)
+    T1 <- ifelse(T1_pre <= t0, T1_pre, t0 + R1_post)
+    
+    R0 <- ifelse(T0 > t0, T0 - t0, NA)
+    R1 <- ifelse(T1 > t0, T1 - t0, NA)
+    
+    dat_list[["0"]] <- data.frame(R = R0)
+    dat_list[["1"]] <- data.frame(R = R1)
+    return(dat_list)
+  }
+  
+  A <- rbinom(n, 1, ps_true) 
+  U_pre  <- runif(n)
+  U_post <- runif(n)
+  log_lam_pre <- lp_T(A)
+  T_pre  <- (-log(U_pre) / exp(log_lam_pre))^(1/nu)
+  R_post <- (-log(U_post) / exp(log_lam_pre))^(1/nu)
+  T_time <- ifelse(T_pre <= t0, T_pre, t0 + R_post)
+  
+  log_lam_C <- gamma[1] + gamma[2]*A + gamma[3]*X[,3] + gamma[4]*X[,1]*X[,3]
+  C_time <- rexp(n, rate = exp(log_lam_C))
+  
+  Y <- pmin(T_time, C_time)
+  Delta <- as.numeric(T_time <= C_time)
+  data.frame(X, A, Y, Delta)
+}
+
+# Alternative data generating function (which is more traditional)
+# But this DGP does not guarantee monotonicity or principal ignorability
+# Therefore, PS estimator will not work in the following DGP, while
+# IW and DR estimators still work well in this DGP
+generate_data_alt <- function(n, t0, beta_trt, is_counterfactual = FALSE) {
+  Sigma <- matrix(0.2, 3, 3); diag(Sigma) <- 1
+  X <- mvrnorm(n, mu = c(0, 0, 0), Sigma = Sigma)
+  colnames(X) <- c("X1", "X2", "X3")
+  
+  lp_A <- alpha[1] + alpha[2]*X[,1] + alpha[3]*X[,2] + alpha[4]*X[,3] + alpha[5]*(X[,1]^2)
+  ps_true <- 1 / (1 + exp(-lp_A))
+  
+  local_beta <- beta
+  local_beta[2] <- beta_trt
+  
+  if(is_counterfactual) {
+    dat_list <- list()
+    for (a in c(0, 1)) {
+      log_lam <- local_beta[1] + local_beta[2]*a + local_beta[3]*X[,1] + local_beta[4]*X[,2] + local_beta[5]*(X[,1]^2)
+      T_val <- (-log(runif(n)) / exp(log_lam))^(1/nu)
+      R_val <- ifelse(T_val > t0, T_val - t0, NA)
+      dat_list[[as.character(a)]] <- data.frame(R=R_val)
+    }
+    return(dat_list)
+  }
+  
+  A <- rbinom(n, 1, ps_true) 
+  log_lam_T <- local_beta[1] + local_beta[2]*A + local_beta[3]*X[,1] + local_beta[4]*X[,2] + local_beta[5]*(X[,1]^2)
+  T_time <- (-log(runif(n)) / exp(log_lam_T))^(1/nu)
+  log_lam_C <- gamma[1] + gamma[2]*A + gamma[3]*X[,3] + gamma[4]*X[,1]*X[,3]
+  C_time <- rexp(n, rate = exp(log_lam_C))
+  
+  Y <- pmin(T_time, C_time)
+  Delta <- as.numeric(T_time <= C_time)
+  data.frame(X, A, Y, Delta)
+}
+
+
+# ==============================================================================
+# 4. ESTIMATOR CORE FUNCTION
+# ==============================================================================
+# This is the workhorse function. It fits models, calculates weights, and solves equations.
+# It returns Point Estimates (bias) and Coverage Indicators.
+
+run_estimators_core <- function(dat, scenario, targets_vec, t0, tau, run_bootstrap=FALSE) {
+  # 1. Define Model Formulas based on Scenario
+  # ------------------------------------------
+  if (scenario == "Correct") { 
+    f_ps <- A ~ X1 + X2 + X3 + I(X1^2); f_c <- Surv(Y, 1-Delta) ~ A + X3 + I(X1*X3)
+    f_out <- Surv(Y, Delta) ~ strata(A) + X1 + X2 + I(X1^2); f_out_x <- ~ X1 + X2 + I(X1^2)
+  } else if (scenario == "Out_Mis") { 
+    f_ps <- A ~ X1 + X2 + X3 + I(X1^2); f_c <- Surv(Y, 1-Delta) ~ A + X3 + I(X1*X3)
+    f_out <- Surv(Y, Delta) ~ strata(A) + X1 + X2; f_out_x <- ~ X1 + X2
+  } else if (scenario == "PS_Mis") { 
+    f_ps <- A ~ X1 + X2 + X3; f_c <- Surv(Y, 1-Delta) ~ A + X3 + I(X1*X3)
+    f_out <- Surv(Y, Delta) ~ strata(A) + X1 + X2 + I(X1^2); f_out_x <- ~ X1 + X2 + I(X1^2)
+  } else { 
+    f_ps <- A ~ X1 + X2 + X3; f_c <- Surv(Y, 1-Delta) ~ A + X3 + I(X1*X3)
+    f_out <- Surv(Y, Delta) ~ strata(A) + X1 + X2; f_out_x <- ~ X1 + X2
+  }
+
+  # 2. Fit Nuisance Models
+  # ----------------------
+  mod_ps <- glm(f_ps, data = dat, family = binomial)
+  ps_hat <- predict(mod_ps, type = "response")
+  mod_c <- coxph(f_c, data = dat); mod_out <- coxph(f_out, data = dat)
+
+  # 3. Pre-process Hazards & Linear Predictors
+  # ------------------------------------------
+  bh_c_lookup <- get_bh_lookup(mod_c); bh_out_lookup <- get_bh_lookup(mod_out)
+  lp_c <- predict(mod_c, newdata=dat, type="lp") 
+  
+  X_out <- model.matrix(f_out_x, data=dat)
+  if("(Intercept)" %in% colnames(X_out)) X_out <- X_out[, -1, drop=FALSE]
+  lp_out <- as.vector(X_out %*% coef(mod_out))
+  
+  # 4. Calculate IPCW Weights (Inverse Probability of Censoring)
+  # ------------------------------------------------------------
+  ghat_Y  <- calc_surv_manual(bh_c_lookup, lp_c, dat$Y, treatment_arm=NULL)
+  ghat_t0 <- calc_surv_manual(bh_c_lookup, lp_c, rep(t0, nrow(dat)), treatment_arm=NULL)
+  w_cen_Y <- 1/pmax(ghat_Y, 0.01); w_cen_t0 <- 1/pmax(ghat_t0, 0.01) 
+
+  # 5. Calculate Counterfactual Survival
+  # ------------------------------------------------------------
+  dat_pi <- dat
+  dat_pi$Y_pi <- pmin(dat_pi$Y, t0)
+  dat_pi$Delta_pi <- as.numeric(dat_pi$Y <= t0 & dat_pi$Delta == 1)
+  
+  f_pi <- f_out
+  f_pi[[2]] <- as.call(list(as.name("Surv"), as.name("Y_pi"), as.name("Delta_pi")))
+  
+  mod_pi <- coxph(f_pi, data = dat_pi)
+  bh_pi_lookup <- get_bh_lookup(mod_pi)
+  
+  X_pi <- model.matrix(f_out_x, data = dat_pi)
+  if ("(Intercept)" %in% colnames(X_pi)) X_pi <- X_pi[, -1, drop = FALSE]
+  lp_pi <- as.vector(X_pi %*% coef(mod_pi))
+  
+  S_out_t0_A1 <- calc_surv_manual(bh_pi_lookup, lp_pi, rep(t0, nrow(dat)), rep(1, nrow(dat)))
+  S_out_t0_A0 <- calc_surv_manual(bh_pi_lookup, lp_pi, rep(t0, nrow(dat)), rep(0, nrow(dat)))
+  
+  log_ratio <- log(pmax(S_out_t0_A0, 1e-8)) - log(pmax(S_out_t0_A1, 1e-8))
+  ratio <- exp(log_ratio)
+  w_ps_vec <- ifelse((dat$A == 1) & (dat$Y > t0), ratio, 1.0)
+
+  # 6. Solvers for Estimating Equations
+  # -----------------------------------
+  solve_fast <- function(f) {
+    grid <- seq(0, 3, length.out=10)
+    vals <- sapply(grid, f)
+    idx <- which(diff(sign(vals)) != 0)
+    if(length(idx)==0) return(if(all(vals>0)) 0 else 3)
+    tryCatch(uniroot(f, c(grid[idx[1]], grid[idx[1]+1]), tol=1e-3)$root, error=function(e) grid[idx[1]])
+  }
+  
+  ee_iw <- function(theta, arm) {
+    idx <- which(dat$A == arm); w <- if(arm==1) 1/ps_hat[idx] else 1/(1-ps_hat[idx])
+    term1 <- w * (dat$Y[idx] > t0 & dat$Y[idx] <= t0+theta & dat$Delta[idx]==1) * w_cen_Y[idx]
+    term2 <- w * (dat$Y[idx] > t0) * w_cen_t0[idx]
+    mean(term1) - tau * mean(term2)
+  }
+  
+  ee_dr <- function(theta, arm) {
+    S_theta <- calc_surv_manual(bh_out_lookup, lp_out, rep(t0+theta, nrow(dat)), rep(arm, nrow(dat)))
+    S_base <- if(arm==1) S_out_t0_A1 else S_out_t0_A0
+    or <- (S_base - S_theta) - tau * S_base
+    w <- if(arm==1) 1/ps_hat else 1/(1-ps_hat); aw <- if(arm==1) (dat$A-ps_hat)/ps_hat else ((1-dat$A)-(1-ps_hat))/(1-ps_hat)
+    idx_n <- (dat$A==arm & dat$Y>t0 & dat$Y<=t0+theta & dat$Delta==1)
+    idx_d <- (dat$A==arm & dat$Y>t0)
+    mean(w * (idx_n*w_cen_Y - tau*idx_d*w_cen_t0) - aw * or)
+  }
+  
+  ee_ps <- function(theta, arm) {
+    idx <- which(dat$A == arm); w <- if(arm==1) 1/ps_hat[idx] else 1/(1-ps_hat[idx])
+    if (arm == 1) w <- w * w_ps_vec[idx]
+    term1 <- w * (dat$Y[idx] > t0 & dat$Y[idx] <= t0+theta & dat$Delta[idx]==1) * w_cen_Y[idx]
+    term2 <- w * (dat$Y[idx] > t0) * w_cen_t0[idx]
+    mean(term1) - tau * mean(term2)
+  }
+  
+  q1_iw <- solve_fast(function(th) ee_iw(th, 1)); q0_iw <- solve_fast(function(th) ee_iw(th, 0))
+  q1_dr <- solve_fast(function(th) ee_dr(th, 1));   q0_dr <- solve_fast(function(th) ee_dr(th, 0))
+  q1_ps <- solve_fast(function(th) ee_ps(th, 1)); q0_ps <- solve_fast(function(th) ee_ps(th, 0))
+  
+  sub1 <- subset(dat, Y > t0 & A == 1); sub0 <- subset(dat, Y > t0 & A == 0)
+  q1_n <- as.numeric(quantile(survfit(Surv(Y-t0, Delta)~1, sub1), 1-tau)$quantile)
+  q0_n <- as.numeric(quantile(survfit(Surv(Y-t0, Delta)~1, sub0), 1-tau)$quantile)
+  
+  ests <- c(Naive = q1_n - q0_n, IW = q1_iw - q0_iw, DR = q1_dr - q0_dr, PS = q1_ps - q0_ps)
+
+  # 7. Bootstrap for Confidence Intervals
+  # -------------------------------------
+  cov_wald <- c(NA, NA, NA, NA)
+  
+  if (run_bootstrap) {
+    boot_res <- matrix(NA, nrow=n_B, ncol=4)
+    for(b in 1:n_B) {
+      idx_b <- sample(1:nrow(dat), nrow(dat), replace=TRUE)
+      try({ boot_res[b, ] <- run_estimators_core(dat[idx_b, ], scenario, targets_vec, t0, tau, FALSE)[1:4] }, silent=TRUE)
+    }
+    
+    se <- apply(boot_res, 2, sd, na.rm=TRUE)
+    
+    for (k in 1:4) {
+      target <- targets_vec[k] 
+      if (!is.na(se[k]) && se[k] > 0) {
+        ci_lo <- ests[k] - 1.96 * se[k]; ci_hi <- ests[k] + 1.96 * se[k]
+        cov_wald[k] <- as.integer(target >= ci_lo & target <= ci_hi)
+      }
+    }
+  }
+  return(c(ests, cov_wald))
+}
+
+# ==============================================================================
+# 5. MASTER EXECUTION LOOP
+# ==============================================================================
+
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+run_grid_row <- function(grid_row) {
+  
+  n_curr    <- grid_row$n_sim
+  t0_curr   <- grid_row$t0
+  tau_curr  <- grid_row$tau
+  beta_curr <- grid_row$beta_trt  
+  
+  cat(paste0("\n==================================================================\n"))
+  cat(sprintf("STARTING RUN: N=%d | T0=%.1f | Tau=%.2f | Beta=%.1f\n", n_curr, t0_curr, tau_curr, beta_curr))
+  cat(paste0("==================================================================\n"))
+  
+  big_dat_list <- generate_data(1000000, t0_curr, beta_curr, TRUE)
+  R1_vec <- big_dat_list[["1"]]$R
+  R0_vec <- big_dat_list[["0"]]$R
+  
+  q1_osqc <- quantile(R1_vec, probs=tau_curr, na.rm=TRUE)
+  q0_osqc <- quantile(R0_vec, probs=tau_curr, na.rm=TRUE)
+  TRUE_OSQC <- as.numeric(q1_osqc - q0_osqc)
+  
+  always_mask <- !is.na(R1_vec) & !is.na(R0_vec)
+  q1_psqc <- quantile(R1_vec[always_mask], probs=tau_curr)
+  q0_psqc <- quantile(R0_vec[always_mask], probs=tau_curr)
+  TRUE_PSQC <- as.numeric(q1_psqc - q0_psqc)
+  
+  TARGETS <- c(TRUE_OSQC, TRUE_OSQC, TRUE_OSQC, TRUE_PSQC)
+  
+  scenarios <- c("Correct", "Out_Mis", "PS_Mis", "Both_Mis")
+  res_list <- list()
+  
+  for (scen in scenarios) {
+    combined_res <- foreach(i = 1:n_total, .combine = rbind, 
+                            .packages = c("survival", "MASS"),
+                            .export = c("get_bh_lookup", "calc_surv_manual", "run_estimators_core", 
+                                        "generate_data", "alpha", "beta", "gamma", "nu", "n_B", "n_cov")) %dopar% {
+                                          set.seed(123 + i)
+                                          dat <- generate_data(n_curr, t0_curr, beta_curr)
+                                          do_boot <- (i <= n_cov)
+                                          run_estimators_core(dat, scen, TARGETS, t0_curr, tau_curr, do_boot)
+                                        }
+    
+    ests <- combined_res[, 1:4]
+    cov_wald <- combined_res[, 5:8]
+    
+    bias <- numeric(4); rmse <- numeric(4)
+    for(k in 1:4) {
+      bias[k] <- mean(ests[, k], na.rm=TRUE) - TARGETS[k]
+      rmse[k] <- sqrt(mean((ests[, k] - TARGETS[k])^2, na.rm=TRUE))
+    }
+    
+    emp_se <- apply(ests, 2, sd, na.rm=TRUE)
+    cp_wald <- colMeans(cov_wald, na.rm=TRUE)
+    
+    summary_vec <- list(
+      Setting = paste0("N", n_curr, "_T", t0_curr, "_Tau", tau_curr, "_Beta", beta_curr),
+      Scenario = scen,
+      Bias = bias, SE = emp_se, RMSE = rmse, CovWald = cp_wald
+    )
+    res_list[[scen]] <- summary_vec
+    cat("Done.\n")
+  }
+  
+  filename <- paste0("SimRes_N", n_curr, "_T", t0_curr, "_Tau", tau_curr, "_Beta", beta_curr, ".RData")
+  save(res_list, file=filename)
+  
+  return(res_list)
+}
+
+all_results_storage <- list()
+
+for(i in 1:nrow(settings_grid)) {
+  current_setting <- settings_grid[i, ]
+  res <- run_grid_row(current_setting)
+  all_results_storage[[i]] <- res
+}
+
+stopCluster(cl)
+
+# ==============================================================================
+# 6. PRINT & SAVE SUMMARY OF ALL RUNS
+# ==============================================================================
+
+for(i in 1:length(all_results_storage)) {
+  
+  res <- all_results_storage[[i]]
+  if(is.null(res) || length(res) == 0) next
+  
+  first_scen_name <- names(res)[1]
+  sett_name <- res[[first_scen_name]]$Setting
+  
+  combined_setting_df <- NULL
+  
+  for(scen in names(res)) {
+    metrics_mat <- rbind(
+      Bias = res[[scen]]$Bias,
+      SE   = res[[scen]]$SE,
+      RMSE = res[[scen]]$RMSE,
+      CovW = res[[scen]]$CovWald
+    )
+    colnames(metrics_mat) <- c("Naive", "IW", "DR", "PS")
+    
+    df_metrics <- as.data.frame(metrics_mat)
+    df_metrics$Metric <- rownames(metrics_mat)
+    df_metrics$Scenario <- scen
+    df_metrics$Setting <- sett_name
+    
+    df_metrics <- df_metrics[, c("Setting", "Scenario", "Metric", "Naive", "IW", "DR", "PS")]
+    combined_setting_df <- rbind(combined_setting_df, df_metrics)
+  }
+  
+  csv_filename <- paste0("Summary_Table_", sett_name, ".csv")
+  write.csv(combined_setting_df, file = csv_filename, row.names = FALSE)
+}
+
+cat("\n>>> ALL RESULTS PROCESSED AND SAVED. <<<\n")
